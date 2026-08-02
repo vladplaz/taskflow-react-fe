@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        # ESLint says nothing about formatting; format:check does.
+        run: |
+          npm run lint
+          npm run format:check
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        # Runs tsc -b first, so this covers type checking too.
+        run: npm run build
+
+      - name: Audit dependencies
+        # Runtime only: a dev-tool advisory is not shipped to anyone.
+        run: npm audit --omit=dev --audit-level=high
