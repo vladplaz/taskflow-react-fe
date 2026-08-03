@@ -200,6 +200,10 @@ export class ApiError extends Error {
   }
 }
 
+export function isUnauthenticated(status: number) {
+  return status === 401 || status === 403
+}
+
 function getCookie(name: string) {
   const prefix = `${name}=`
   const cookie = document.cookie.split('; ').find((value) => value.startsWith(prefix))
@@ -210,26 +214,59 @@ function isUnsafeMethod(method: string | undefined) {
   return method !== undefined && !['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method.toUpperCase())
 }
 
+let pendingCsrf: Promise<void> | null = null
+
+/** The CSRF cookie, fetching one first if this tab does not have it yet. */
+async function csrfToken() {
+  const existing = getCookie('csrftoken')
+  if (existing) return existing
+
+  // Shared, so several mutations firing at once cost one round trip.
+  pendingCsrf ??= ensureCsrfToken().finally(() => {
+    pendingCsrf = null
+  })
+  await pendingCsrf
+
+  const token = getCookie('csrftoken')
+  if (!token) {
+    throw new ApiError(403, 'Your browser is blocking cookies for this site, so signing in cannot work')
+  }
+  return token
+}
+
+const GENERIC_ERROR = 'Something went wrong. Please try again'
+
+/** Keys that describe the failure itself rather than name a rejected field. */
+const ENVELOPE_KEYS = new Set(['detail', 'message', 'statusCode', 'error'])
+
+/** A string, or a list of them, as the list. Anything else has no message. */
+function toMessages(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((message): message is string => typeof message === 'string')
+  return typeof value === 'string' ? [value] : []
+}
+
 function getApiError(body: unknown, status: number) {
   if (typeof body !== 'object' || body === null) {
-    return new ApiError(status, 'Something went wrong. Please try again')
+    return new ApiError(status, GENERIC_ERROR)
   }
 
   const responseBody = body as Record<string, unknown>
+  const nested = responseBody.errors
+  const isNested = typeof nested === 'object' && nested !== null && !Array.isArray(nested)
+  const fieldSource = isNested ? (nested as Record<string, unknown>) : responseBody
+
   const fields = Object.fromEntries(
-    Object.entries(responseBody).flatMap(([field, value]) => {
-      const messages = Array.isArray(value)
-        ? value.filter((message): message is string => typeof message === 'string')
-        : typeof value === 'string'
-          ? [value]
-          : []
-      return messages.length ? [[field, messages.map((message) => normalizeErrorMessage(message))]] : []
+    Object.entries(fieldSource).flatMap(([field, value]) => {
+      // Only at the top level: inside `errors`, every key really is a field.
+      if (!isNested && ENVELOPE_KEYS.has(field)) return []
+      const messages = toMessages(value).map(normalizeErrorMessage)
+      return messages.length ? [[field, messages]] : []
     }),
   )
-  const detail =
-    typeof responseBody.detail === 'string' ? normalizeErrorMessage(responseBody.detail) : undefined
+
+  const summary = toMessages(responseBody.detail ?? responseBody.message)[0]
   const firstField = Object.entries(fields)[0]
-  const message = detail ?? (firstField ? firstField[1][0] : 'Something went wrong. Please try again')
+  const message = firstField?.[1][0] ?? (summary ? normalizeErrorMessage(summary) : GENERIC_ERROR)
   return new ApiError(status, message, fields)
 }
 
@@ -246,11 +283,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set('Content-Type', 'application/json')
   }
   if (isUnsafeMethod(init.method)) {
-    const csrfToken = getCookie('csrftoken')
-    if (!csrfToken) {
-      throw new ApiError(403, 'Security token is missing. Please refresh the page')
-    }
-    headers.set('X-CSRFToken', csrfToken)
+    headers.set('X-CSRFToken', await csrfToken())
   }
 
   const url = /^https?:\/\//.test(path) ? path : `${API_BASE_URL}${path}`
@@ -273,21 +306,56 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export type Paginated<T> = {
-  count: number
-  next: string | null
-  previous: string | null
-  results: T[]
+  items: T[]
+  total: number
+  hasMore: boolean
+  nextUrl: string | null
+}
+
+function normalizePage<T>(body: unknown): Paginated<T> {
+  const page = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+
+  if (Array.isArray(page.results)) {
+    const next = typeof page.next === 'string' ? page.next : null
+    return {
+      items: page.results as T[],
+      total: typeof page.count === 'number' ? page.count : page.results.length,
+      hasMore: next !== null,
+      nextUrl: next,
+    }
+  }
+
+  const items = Array.isArray(page.items) ? (page.items as T[]) : []
+  const total = typeof page.total === 'number' ? page.total : items.length
+  const delivered =
+    typeof page.offset === 'number'
+      ? page.offset + items.length
+      : Number(page.page ?? 1) * Number(page.page_size ?? items.length)
+  return { items, total, hasMore: items.length > 0 && delivered < total, nextUrl: null }
+}
+
+async function requestPage<T>(path: string, init: RequestInit = {}): Promise<Paginated<T>> {
+  return normalizePage<T>(await request<unknown>(path, init))
+}
+
+function withPage(path: string, page: number) {
+  const [base, query = ''] = path.split('?')
+  const params = new URLSearchParams(query)
+  params.set('page', String(page))
+  return `${base}?${params}`
 }
 
 /** Fetch every page of a paginated list endpoint, as one plain array. */
 async function requestList<T>(path: string, init: RequestInit = {}): Promise<T[]> {
   const items: T[] = []
-  let page: Paginated<T> = await request<Paginated<T>>(path, init)
-  items.push(...page.results)
+  let pageNumber = 1
+  let page = await requestPage<T>(path, init)
+  items.push(...page.items)
 
-  while (page.next) {
-    page = await request<Paginated<T>>(page.next, init)
-    items.push(...page.results)
+  while (page.hasMore) {
+    pageNumber += 1
+    page = await requestPage<T>(page.nextUrl ?? withPage(path, pageNumber), init)
+    items.push(...page.items)
   }
 
   return items
@@ -327,7 +395,7 @@ export async function restoreSession() {
   try {
     return await getCurrentUser()
   } catch (error) {
-    if (error instanceof ApiError && error.status === 403) {
+    if (error instanceof ApiError && isUnauthenticated(error.status)) {
       return null
     }
     throw error
@@ -545,7 +613,7 @@ export function getTaskActivityBatch(
   { limit, offset }: { limit: number; offset: number },
 ) {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
-  return request<Paginated<TaskActivity>>(`/workspaces/${workspaceId}/tasks/${taskId}/activity/?${query}`)
+  return requestPage<TaskActivity>(`/workspaces/${workspaceId}/tasks/${taskId}/activity/?${query}`)
 }
 
 export function createTaskComment(
@@ -607,7 +675,7 @@ export function attachmentSrc(
 }
 
 /** Upload one file. `XMLHttpRequest` because only XHR reports progress. */
-export function uploadAttachment(
+export async function uploadAttachment(
   workspaceId: number,
   taskId: number,
   file: File,
@@ -621,13 +689,9 @@ export function uploadAttachment(
     signal?: AbortSignal
   } = {},
 ) {
-  return new Promise<Attachment>((resolve, reject) => {
-    const csrfToken = getCookie('csrftoken')
-    if (!csrfToken) {
-      reject(new ApiError(403, 'Security token is missing. Please refresh the page'))
-      return
-    }
+  const token = await csrfToken()
 
+  return new Promise<Attachment>((resolve, reject) => {
     const body = new FormData()
     body.append('file', file)
     body.append('placement', placement)
@@ -637,7 +701,7 @@ export function uploadAttachment(
     request.withCredentials = true
     request.responseType = 'json'
     request.setRequestHeader('Accept', 'application/json')
-    request.setRequestHeader('X-CSRFToken', csrfToken)
+    request.setRequestHeader('X-CSRFToken', token)
     // Content-Type stays unset so the browser adds the multipart boundary.
 
     request.upload.addEventListener('progress', (event) => {

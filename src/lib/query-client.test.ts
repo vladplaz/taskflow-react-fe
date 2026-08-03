@@ -42,6 +42,26 @@ describe('session revalidation', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: currentUserQueryKey })
   })
 
+  // Django answers an unauthenticated request with 403, NestJS with 401. The
+  // same build has to recognise both as a session that needs re-checking.
+  it('re-checks the session on a 401 as well as a 403', async () => {
+    const client = createQueryClient()
+    const invalidate = vi.spyOn(client, 'invalidateQueries').mockResolvedValue()
+
+    await failing(client, ['boards', 1], new ApiError(401, 'Unauthorized')).catch(() => {})
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: currentUserQueryKey })
+  })
+
+  it('does not re-check the session because the session check itself returned 401', async () => {
+    const client = createQueryClient()
+    const invalidate = vi.spyOn(client, 'invalidateQueries').mockResolvedValue()
+
+    await failing(client, currentUserQueryKey, new ApiError(401, 'Unauthorized')).catch(() => {})
+
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
   it('leaves the session alone for every other failure', async () => {
     const client = createQueryClient()
     const invalidate = vi.spyOn(client, 'invalidateQueries').mockResolvedValue()

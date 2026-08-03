@@ -1,11 +1,11 @@
 import { MutationCache, QueryCache, QueryClient } from '@tanstack/react-query'
 
-import { ApiError } from './api'
+import { ApiError, isUnauthenticated } from './api'
 import { currentUserQueryKey } from '../features/auth/use-auth'
 
 /**
- * Give up on anything the server answered deliberately: 403 and 404 are how
- * this API says "not signed in", "not yours", and "gone".
+ * Give up on anything the server answered deliberately: 401, 403 and 404 are
+ * how this API says "not signed in", "not yours", and "gone".
  */
 export function shouldRetry(failureCount: number, error: unknown) {
   if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false
@@ -15,10 +15,11 @@ export function shouldRetry(failureCount: number, error: unknown) {
 /**
  * Notice when the session has gone out from under us. A 403 is either an
  * expired session or a genuine denial; re-running the session query is what
- * tells them apart, and drops the app to sign-in when it is the former.
+ * tells them apart, and drops the app to sign-in when it is the former. A 401
+ * is only ever the first, and costs the same one request to confirm.
  */
-function revalidateSessionOn403(client: QueryClient, error: unknown, queryKey?: readonly unknown[]) {
-  if (!(error instanceof ApiError) || error.status !== 403) return
+function revalidateSessionOnAuthError(client: QueryClient, error: unknown, queryKey?: readonly unknown[]) {
+  if (!(error instanceof ApiError) || !isUnauthenticated(error.status)) return
   if (queryKey?.[0] === currentUserQueryKey[0]) return
   void client.invalidateQueries({ queryKey: currentUserQueryKey })
 }
@@ -35,10 +36,10 @@ export function createQueryClient() {
       },
     },
     queryCache: new QueryCache({
-      onError: (error, query) => revalidateSessionOn403(client, error, query.queryKey),
+      onError: (error, query) => revalidateSessionOnAuthError(client, error, query.queryKey),
     }),
     mutationCache: new MutationCache({
-      onError: (error) => revalidateSessionOn403(client, error),
+      onError: (error) => revalidateSessionOnAuthError(client, error),
     }),
   })
   return client

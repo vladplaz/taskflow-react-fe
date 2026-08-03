@@ -79,7 +79,7 @@ export const TASK_ACTIVITY_BATCH = 10
 
 /** `undefined` ends the pagination -- React Query reads it as "no next page". */
 export function nextTaskActivityBatch(lastPage: Paginated<TaskActivity>, loadedCount: number) {
-  return lastPage.next ? { limit: TASK_ACTIVITY_BATCH, offset: loadedCount } : undefined
+  return lastPage.hasMore ? { limit: TASK_ACTIVITY_BATCH, offset: loadedCount } : undefined
 }
 
 export function useTaskActivity(workspaceId: number, taskId: number, enabled = true) {
@@ -90,7 +90,7 @@ export function useTaskActivity(workspaceId: number, taskId: number, enabled = t
     getNextPageParam: (lastPage, loadedPages) =>
       nextTaskActivityBatch(
         lastPage,
-        loadedPages.reduce((count, page) => count + page.results.length, 0),
+        loadedPages.reduce((count, page) => count + page.items.length, 0),
       ),
     enabled,
   })

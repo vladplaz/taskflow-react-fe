@@ -46,9 +46,9 @@ export function TaskActivityTimeline({
   workspaceId: number
 }) {
   const activity = useTaskActivity(workspaceId, taskId)
-  const events = activity.data?.pages.flatMap((page) => page.results) ?? []
+  const events = activity.data?.pages.flatMap((page) => page.items) ?? []
   // Every page carries the same total.
-  const total = activity.data?.pages[0]?.count ?? 0
+  const total = activity.data?.pages[0]?.total ?? 0
   const hidden = Math.max(total - events.length, 0)
 
   return (
